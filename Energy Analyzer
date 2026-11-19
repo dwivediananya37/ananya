@@ -1,0 +1,824 @@
+/*
+ * Smart Energy Consumption Analyzer
+ * ---------------------------------
+ * Console application that records appliance usage logs, computes energy
+ * (kWh) and cost, and produces reports and saving suggestions.
+ *
+ * Concepts used: structures, pointers, malloc/realloc/free, functions,
+ * string handling (date/time parsing), loops, arrays, decision logic,
+ * file I/O (persistence).
+ *
+ * Build:  gcc -Wall -Wextra -std=c99 -o energy_analyzer energy_analyzer.c
+ * Run:    ./energy_analyzer
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define NAME_LEN    50
+#define LINE_LEN    128
+#define DATA_FILE   "energy_data.txt"
+#define BAR_WIDTH   40
+#define INIT_CAP    4
+
+/* ------------------------------------------------------------------ */
+/*  Data structures                                                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char   name[NAME_LEN];
+    double watts;                 /* power rating in watts */
+} Appliance;
+
+typedef struct {
+    int    app_id;                /* index into appliance array */
+    int    day, month, year;      /* date the usage pattern started */
+    int    start_min;             /* start time, minutes since midnight */
+    int    end_min;               /* end time, minutes since midnight */
+    int    days_used;             /* how many days this session was repeated */
+    double kwh_session;           /* energy of ONE session (kWh) */
+    double kwh_total;             /* kwh_session * days_used */
+} Usage;
+
+typedef struct {
+    Appliance *apps;              /* dynamic array of appliances */
+    size_t     app_count, app_cap;
+    Usage     *logs;              /* dynamic array of usage entries */
+    size_t     log_count, log_cap;
+    double     tariff;            /* cost per kWh */
+} Store;
+
+static Store *g_store = NULL;     /* used only to save on unexpected EOF */
+
+/* ------------------------------------------------------------------ */
+/*  Forward declarations                                               */
+/* ------------------------------------------------------------------ */
+
+static int save_data(const Store *s);
+
+/* ------------------------------------------------------------------ */
+/*  Input helpers (validation)                                         */
+/* ------------------------------------------------------------------ */
+
+static void trim(char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+}
+
+/* Reads one line safely. Exits (after saving) if input is closed. */
+static void read_line(const char *prompt, char *buf, size_t size)
+{
+    fputs(prompt, stdout);
+    fflush(stdout);
+    if (!fgets(buf, (int)size, stdin)) {
+        puts("\nInput closed. Saving and exiting.");
+        if (g_store) save_data(g_store);
+        exit(0);
+    }
+    if (!strchr(buf, '\n')) {                 /* discard overlong remainder */
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) { }
+    }
+    trim(buf);
+}
+
+static int read_int(const char *prompt, int lo, int hi)
+{
+    char buf[LINE_LEN], *end;
+    for (;;) {
+        read_line(prompt, buf, sizeof buf);
+        long v = strtol(buf, &end, 10);
+        if (buf[0] != '\0' && *end == '\0' && v >= lo && v <= hi)
+            return (int)v;
+        printf("  Invalid input. Enter a whole number between %d and %d.\n", lo, hi);
+    }
+}
+
+static double read_double(const char *prompt, double lo, double hi)
+{
+    char buf[LINE_LEN], *end;
+    for (;;) {
+        read_line(prompt, buf, sizeof buf);
+        double v = strtod(buf, &end);
+        if (buf[0] != '\0' && *end == '\0' && v >= lo && v <= hi)
+            return v;
+        printf("  Invalid input. Enter a number between %g and %g.\n", lo, hi);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Date / time parsing (string handling)                              */
+/* ------------------------------------------------------------------ */
+
+static int is_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+static int days_in_month(int m, int y)
+{
+    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    return (m == 2 && is_leap(y)) ? 29 : d[m - 1];
+}
+
+/* Parses "DD-MM-YYYY" (also accepts '/'). Returns 1 on success. */
+static int parse_date(const char *str, int *d, int *m, int *y)
+{
+    char tmp[LINE_LEN];
+    int n = 0;
+    strncpy(tmp, str, sizeof tmp - 1);
+    tmp[sizeof tmp - 1] = '\0';
+    for (char *p = tmp; *p; p++) if (*p == '/') *p = '-';
+    if (sscanf(tmp, "%d-%d-%d%n", d, m, y, &n) != 3 || tmp[n] != '\0') return 0;
+    if (*y < 1970 || *y > 2100 || *m < 1 || *m > 12) return 0;
+    if (*d < 1 || *d > days_in_month(*m, *y)) return 0;
+    return 1;
+}
+
+/* Parses "HH:MM" (24 hour). Returns minutes since midnight or -1. */
+static int parse_time(const char *str)
+{
+    int h, m, n = 0;
+    if (sscanf(str, "%d:%d%n", &h, &m, &n) != 2 || str[n] != '\0') return -1;
+    if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+    return h * 60 + m;
+}
+
+static void read_date(const char *prompt, int *d, int *m, int *y)
+{
+    char buf[LINE_LEN];
+    for (;;) {
+        read_line(prompt, buf, sizeof buf);
+        if (parse_date(buf, d, m, y)) return;
+        puts("  Invalid date. Use DD-MM-YYYY, e.g. 15-11-2026.");
+    }
+}
+
+static int read_time(const char *prompt)
+{
+    char buf[LINE_LEN];
+    for (;;) {
+        read_line(prompt, buf, sizeof buf);
+        int t = parse_time(buf);
+        if (t >= 0) return t;
+        puts("  Invalid time. Use 24-hour HH:MM, e.g. 18:30.");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Core calculations                                                  */
+/* ------------------------------------------------------------------ */
+
+/* Length of a session in minutes; an end earlier than start means the
+   session runs past midnight. */
+static int duration_min(int start, int end)
+{
+    return (end > start) ? end - start : end + 1440 - start;
+}
+
+static void compute_usage(const Appliance *a, Usage *u)
+{
+    double hours = duration_min(u->start_min, u->end_min) / 60.0;
+    u->kwh_session = a->watts * hours / 1000.0;
+    u->kwh_total   = u->kwh_session * u->days_used;
+}
+
+static void recompute_all(Store *s)
+{
+    for (size_t i = 0; i < s->log_count; i++)
+        compute_usage(&s->apps[s->logs[i].app_id], &s->logs[i]);
+}
+
+/* True if the entry falls in the given month. month==0 means "all time". */
+static int in_period(const Usage *u, int month, int year)
+{
+    return month == 0 || (u->month == month && u->year == year);
+}
+
+/* Fills kwh[] and hrs[] (one slot per appliance) for the chosen period. */
+static void aggregate(const Store *s, int month, int year, double *kwh, double *hrs)
+{
+    for (size_t i = 0; i < s->app_count; i++) kwh[i] = hrs[i] = 0.0;
+    for (size_t i = 0; i < s->log_count; i++) {
+        const Usage *u = &s->logs[i];
+        if (!in_period(u, month, year)) continue;
+        kwh[u->app_id] += u->kwh_total;
+        hrs[u->app_id] += duration_min(u->start_min, u->end_min) / 60.0 * u->days_used;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dynamic array management (malloc / realloc)                        */
+/* ------------------------------------------------------------------ */
+
+static int store_init(Store *s)
+{
+    s->app_cap = s->log_cap = INIT_CAP;
+    s->app_count = s->log_count = 0;
+    s->tariff = 0.0;
+    s->apps = malloc(s->app_cap * sizeof *s->apps);
+    s->logs = malloc(s->log_cap * sizeof *s->logs);
+    if (!s->apps || !s->logs) { free(s->apps); free(s->logs); return 0; }
+    return 1;
+}
+
+static void store_free(Store *s)
+{
+    free(s->apps);
+    free(s->logs);
+    s->apps = NULL; s->logs = NULL;
+    s->app_count = s->app_cap = s->log_count = s->log_cap = 0;
+}
+
+/* Returns a pointer to a fresh slot, growing the array if needed. */
+static Appliance *new_appliance_slot(Store *s)
+{
+    if (s->app_count == s->app_cap) {
+        size_t ncap = s->app_cap * 2;
+        Appliance *tmp = realloc(s->apps, ncap * sizeof *tmp);
+        if (!tmp) return NULL;
+        s->apps = tmp;
+        s->app_cap = ncap;
+    }
+    return &s->apps[s->app_count++];
+}
+
+static Usage *new_usage_slot(Store *s)
+{
+    if (s->log_count == s->log_cap) {
+        size_t ncap = s->log_cap * 2;
+        Usage *tmp = realloc(s->logs, ncap * sizeof *tmp);
+        if (!tmp) return NULL;
+        s->logs = tmp;
+        s->log_cap = ncap;
+    }
+    return &s->logs[s->log_count++];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Display helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+static const char *MONTH_NAMES[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
+
+static void fmt_time(int minutes, char *out)
+{
+    sprintf(out, "%02d:%02d", minutes / 60, minutes % 60);
+}
+
+static void print_bar(double value, double max)
+{
+    int len = (max > 0) ? (int)(value / max * BAR_WIDTH + 0.5) : 0;
+    if (value > 0 && len == 0) len = 1;
+    for (int i = 0; i < len; i++) putchar('#');
+}
+
+static int case_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+static void list_appliances(const Store *s)
+{
+    if (s->app_count == 0) { puts("  (no appliances yet)"); return; }
+    printf("  %-3s %-24s %10s\n", "#", "Appliance", "Watts");
+    for (size_t i = 0; i < s->app_count; i++)
+        printf("  %-3zu %-24s %10.1f\n", i + 1, s->apps[i].name, s->apps[i].watts);
+}
+
+/* Lets the user pick an appliance. Returns index, or -1 if none exist. */
+static int select_appliance(const Store *s)
+{
+    if (s->app_count == 0) { puts("Add an appliance first."); return -1; }
+    list_appliances(s);
+    return read_int("Select appliance number: ", 1, (int)s->app_count) - 1;
+}
+
+/* Asks for a month as MM-YYYY. Empty input = all time (returns 0). */
+static int read_period(const char *prompt, int *month, int *year)
+{
+    char buf[LINE_LEN];
+    for (;;) {
+        read_line(prompt, buf, sizeof buf);
+        if (buf[0] == '\0') { *month = 0; *year = 0; return 0; }
+        int n = 0;
+        if (sscanf(buf, "%d-%d%n", month, year, &n) == 2 && buf[n] == '\0' &&
+            *month >= 1 && *month <= 12 && *year >= 1970 && *year <= 2100)
+            return 1;
+        puts("  Invalid month. Use MM-YYYY (e.g. 11-2026) or press Enter for all time.");
+    }
+}
+
+static void period_label(int month, int year, char *out)
+{
+    if (month == 0) strcpy(out, "All time");
+    else sprintf(out, "%s %d", MONTH_NAMES[month - 1], year);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Menu operations: appliances                                        */
+/* ------------------------------------------------------------------ */
+
+static void add_appliance(Store *s)
+{
+    char name[NAME_LEN];
+    for (;;) {
+        read_line("Appliance name: ", name, sizeof name);
+        if (name[0] == '\0') { puts("  Name cannot be empty."); continue; }
+        if (strchr(name, '|')) { puts("  Name cannot contain '|'."); continue; }
+        int dup = 0;
+        for (size_t i = 0; i < s->app_count; i++)
+            if (case_equal(s->apps[i].name, name)) dup = 1;
+        if (dup) { puts("  An appliance with that name already exists."); continue; }
+        break;
+    }
+    double watts = read_double("Power rating (watts, 1-20000): ", 1, 20000);
+
+    Appliance *a = new_appliance_slot(s);
+    if (!a) { puts("Out of memory."); return; }
+    strcpy(a->name, name);
+    a->watts = watts;
+    printf("Added '%s' (%.1f W).\n", a->name, a->watts);
+}
+
+static void edit_appliance(Store *s)
+{
+    int idx = select_appliance(s);
+    if (idx < 0) return;
+    Appliance *a = &s->apps[idx];
+    char buf[LINE_LEN];
+
+    for (;;) {
+        printf("New name [%s] (Enter to keep): ", a->name);
+        fflush(stdout);
+        read_line("", buf, sizeof buf);
+        if (buf[0] == '\0') break;
+        if (strlen(buf) >= NAME_LEN || strchr(buf, '|')) {
+            puts("  Name too long or contains '|'."); continue;
+        }
+        int dup = 0;
+        for (size_t i = 0; i < s->app_count; i++)
+            if ((int)i != idx && case_equal(s->apps[i].name, buf)) dup = 1;
+        if (dup) { puts("  Name already used."); continue; }
+        strcpy(a->name, buf);
+        break;
+    }
+
+    for (;;) {
+        printf("New watts [%.1f] (Enter to keep): ", a->watts);
+        fflush(stdout);
+        read_line("", buf, sizeof buf);
+        if (buf[0] == '\0') break;
+        char *end;
+        double w = strtod(buf, &end);
+        if (*end == '\0' && w >= 1 && w <= 20000) { a->watts = w; break; }
+        puts("  Invalid wattage (1-20000).");
+    }
+    recompute_all(s);
+    puts("Appliance updated; all related usage entries recalculated.");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Menu operations: usage entries                                     */
+/* ------------------------------------------------------------------ */
+
+static void read_usage_fields(Usage *u)
+{
+    read_date("Start date (DD-MM-YYYY): ", &u->day, &u->month, &u->year);
+    for (;;) {
+        u->start_min = read_time("Start time (HH:MM, 24h): ");
+        u->end_min   = read_time("End time   (HH:MM, 24h): ");
+        if (u->start_min != u->end_min) break;
+        puts("  Start and end time cannot be equal.");
+    }
+    if (u->end_min < u->start_min)
+        puts("  (End is earlier than start: treated as running past midnight.)");
+
+    int dim = days_in_month(u->month, u->year);
+    char prompt[LINE_LEN];
+    sprintf(prompt, "Days used this month with this pattern (1-%d): ", dim);
+    u->days_used = read_int(prompt, 1, dim);
+}
+
+static void add_usage(Store *s)
+{
+    int idx = select_appliance(s);
+    if (idx < 0) return;
+
+    Usage tmp;
+    tmp.app_id = idx;
+    read_usage_fields(&tmp);
+    compute_usage(&s->apps[idx], &tmp);
+
+    Usage *u = new_usage_slot(s);
+    if (!u) { puts("Out of memory."); return; }
+    *u = tmp;
+    printf("Logged: %.3f kWh per session, %.3f kWh total", u->kwh_session, u->kwh_total);
+    if (s->tariff > 0) printf(" (cost %.2f)", u->kwh_total * s->tariff);
+    puts(".");
+}
+
+static void list_usage(const Store *s)
+{
+    if (s->log_count == 0) { puts("  (no usage entries yet)"); return; }
+    printf("  %-3s %-18s %-10s %-5s %-5s %-5s %-10s %-10s\n",
+           "#", "Appliance", "Date", "Start", "End", "Days", "kWh/sess", "kWh total");
+    for (size_t i = 0; i < s->log_count; i++) {
+        const Usage *u = &s->logs[i];
+        char st[8], en[8];
+        fmt_time(u->start_min, st);
+        fmt_time(u->end_min, en);
+        printf("  %-3zu %-18.18s %02d-%02d-%04d %-5s %-5s %-5d %-10.3f %-10.3f\n",
+               i + 1, s->apps[u->app_id].name, u->day, u->month, u->year,
+               st, en, u->days_used, u->kwh_session, u->kwh_total);
+    }
+}
+
+static void edit_or_delete_usage(Store *s)
+{
+    if (s->log_count == 0) { puts("No usage entries to edit."); return; }
+    list_usage(s);
+    int n = read_int("Entry number to change: ", 1, (int)s->log_count) - 1;
+    int choice = read_int("1 = Edit, 2 = Delete, 0 = Cancel: ", 0, 2);
+    if (choice == 0) return;
+
+    if (choice == 2) {
+        for (size_t i = (size_t)n; i + 1 < s->log_count; i++)
+            s->logs[i] = s->logs[i + 1];
+        s->log_count--;
+        puts("Entry deleted.");
+        return;
+    }
+
+    Usage *u = &s->logs[n];
+    int idx = select_appliance(s);
+    if (idx < 0) return;
+    u->app_id = idx;
+    read_usage_fields(u);
+    compute_usage(&s->apps[idx], u);
+    puts("Entry updated.");
+}
+
+static void set_tariff(Store *s)
+{
+    s->tariff = read_double("Tariff per kWh (e.g. 8.50): ", 0, 10000);
+    printf("Tariff set to %.2f per kWh.\n", s->tariff);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Reports                                                            */
+/* ------------------------------------------------------------------ */
+
+static int ensure_ready(const Store *s)
+{
+    if (s->app_count == 0 || s->log_count == 0) {
+        puts("Add at least one appliance and one usage entry first.");
+        return 0;
+    }
+    return 1;
+}
+
+static void report_monthly(const Store *s)
+{
+    if (!ensure_ready(s)) return;
+    int month, year;
+    read_period("Month (MM-YYYY) or Enter for all time: ", &month, &year);
+
+    double *kwh = calloc(s->app_count, sizeof *kwh);
+    double *hrs = calloc(s->app_count, sizeof *hrs);
+    if (!kwh || !hrs) { puts("Out of memory."); free(kwh); free(hrs); return; }
+    aggregate(s, month, year, kwh, hrs);
+
+    char label[32];
+    period_label(month, year, label);
+    printf("\n=== Energy report: %s ===\n", label);
+    printf("%-22s %8s %9s %10s %10s\n", "Appliance", "Watts", "Hours", "kWh", "Cost");
+    double tk = 0, th = 0;
+    for (size_t i = 0; i < s->app_count; i++) {
+        printf("%-22.22s %8.1f %9.2f %10.3f %10.2f\n", s->apps[i].name,
+               s->apps[i].watts, hrs[i], kwh[i], kwh[i] * s->tariff);
+        tk += kwh[i]; th += hrs[i];
+    }
+    printf("%-22s %8s %9.2f %10.3f %10.2f\n", "TOTAL", "", th, tk, tk * s->tariff);
+    if (s->tariff <= 0) puts("(Tariff not set: use option 7 to see costs.)");
+    free(kwh); free(hrs);
+}
+
+/* Sorts index array by kwh descending (selection sort). */
+static void sort_desc(size_t *idx, const double *kwh, size_t n)
+{
+    for (size_t i = 0; i < n; i++) idx[i] = i;
+    for (size_t i = 0; i + 1 < n; i++) {
+        size_t best = i;
+        for (size_t j = i + 1; j < n; j++)
+            if (kwh[idx[j]] > kwh[idx[best]]) best = j;
+        size_t t = idx[i]; idx[i] = idx[best]; idx[best] = t;
+    }
+}
+
+static void report_top3(const Store *s)
+{
+    if (!ensure_ready(s)) return;
+    int month, year;
+    read_period("Month (MM-YYYY) or Enter for all time: ", &month, &year);
+
+    size_t n = s->app_count;
+    double *kwh = calloc(n, sizeof *kwh);
+    double *hrs = calloc(n, sizeof *hrs);
+    size_t *idx = malloc(n * sizeof *idx);
+    if (!kwh || !hrs || !idx) { puts("Out of memory."); free(kwh); free(hrs); free(idx); return; }
+    aggregate(s, month, year, kwh, hrs);
+    sort_desc(idx, kwh, n);
+
+    double total = 0;
+    for (size_t i = 0; i < n; i++) total += kwh[i];
+
+    char label[32];
+    period_label(month, year, label);
+    printf("\n=== Top 3 consumers: %s ===\n", label);
+    for (size_t r = 0; r < n && r < 3; r++) {
+        size_t i = idx[r];
+        if (kwh[i] <= 0) break;
+        printf("%zu. %-20.20s %9.3f kWh  cost %8.2f  (%4.1f%%)  ",
+               r + 1, s->apps[i].name, kwh[i], kwh[i] * s->tariff,
+               total > 0 ? kwh[i] / total * 100 : 0);
+        print_bar(kwh[i], kwh[idx[0]]);
+        putchar('\n');
+    }
+    if (total <= 0) puts("No usage recorded in this period.");
+    free(kwh); free(hrs); free(idx);
+}
+
+/* Builds a sorted list of distinct (year*12+month-1) keys in the logs. */
+static int cmp_int(const void *a, const void *b)
+{
+    return *(const int *)a - *(const int *)b;
+}
+
+static void report_comparison(const Store *s)
+{
+    if (!ensure_ready(s)) return;
+
+    int *keys = malloc(s->log_count * sizeof *keys);
+    if (!keys) { puts("Out of memory."); return; }
+    size_t nk = 0;
+    for (size_t i = 0; i < s->log_count; i++) {
+        int k = s->logs[i].year * 12 + s->logs[i].month - 1;
+        int found = 0;
+        for (size_t j = 0; j < nk; j++) if (keys[j] == k) found = 1;
+        if (!found) keys[nk++] = k;
+    }
+    qsort(keys, nk, sizeof *keys, cmp_int);
+
+    double *tot = calloc(nk, sizeof *tot);
+    if (!tot) { puts("Out of memory."); free(keys); return; }
+    double max = 0;
+    for (size_t j = 0; j < nk; j++) {
+        for (size_t i = 0; i < s->log_count; i++) {
+            const Usage *u = &s->logs[i];
+            if (u->year * 12 + u->month - 1 == keys[j]) tot[j] += u->kwh_total;
+        }
+        if (tot[j] > max) max = tot[j];
+    }
+
+    puts("\n=== Monthly comparison (total kWh) ===");
+    for (size_t j = 0; j < nk; j++) {
+        int y = keys[j] / 12, m = keys[j] % 12;
+        printf("%s %d | ", MONTH_NAMES[m], y);
+        print_bar(tot[j], max);
+        printf(" %.2f kWh", tot[j]);
+        if (s->tariff > 0) printf("  (cost %.2f)", tot[j] * s->tariff);
+        if (j > 0 && tot[j - 1] > 0)
+            printf("  [%+.1f%% vs prev]", (tot[j] - tot[j - 1]) / tot[j - 1] * 100);
+        putchar('\n');
+    }
+
+    /* Optional per-appliance chart for one chosen month */
+    int pick = read_int("Show per-appliance chart? 1 = yes, 0 = no: ", 0, 1);
+    if (pick) {
+        int month, year;
+        while (!read_period("Month (MM-YYYY): ", &month, &year))
+            puts("  A month is required here.");
+        size_t n = s->app_count;
+        double *kwh = calloc(n, sizeof *kwh);
+        double *hrs = calloc(n, sizeof *hrs);
+        if (kwh && hrs) {
+            aggregate(s, month, year, kwh, hrs);
+            double mx = 0;
+            for (size_t i = 0; i < n; i++) if (kwh[i] > mx) mx = kwh[i];
+            printf("\n--- %s %d by appliance ---\n", MONTH_NAMES[month - 1], year);
+            for (size_t i = 0; i < n; i++) {
+                printf("%-18.18s | ", s->apps[i].name);
+                print_bar(kwh[i], mx);
+                printf(" %.2f kWh\n", kwh[i]);
+            }
+        }
+        free(kwh); free(hrs);
+    }
+    free(keys); free(tot);
+}
+
+static void report_suggestions(const Store *s)
+{
+    if (!ensure_ready(s)) return;
+    int month, year;
+    read_period("Analyse month (MM-YYYY) or Enter for all time: ", &month, &year);
+
+    size_t n = s->app_count;
+    double *kwh = calloc(n, sizeof *kwh);
+    double *hrs = calloc(n, sizeof *hrs);
+    size_t *idx = malloc(n * sizeof *idx);
+    if (!kwh || !hrs || !idx) { puts("Out of memory."); free(kwh); free(hrs); free(idx); return; }
+    aggregate(s, month, year, kwh, hrs);
+    sort_desc(idx, kwh, n);
+
+    char label[32];
+    period_label(month, year, label);
+    printf("\n=== Suggestions to reduce consumption (%s) ===\n", label);
+
+    int shown = 0;
+    for (size_t r = 0; r < n && r < 3; r++) {
+        size_t a = idx[r];
+        if (kwh[a] <= 0) break;
+        shown++;
+        const Appliance *A = &s->apps[a];
+        printf("\n%zu. %s (%.0f W, %.2f h, %.2f kWh)\n", r + 1, A->name, A->watts, hrs[a], kwh[a]);
+
+        /* Suggestion type 1: cut hours by 20% */
+        double cut = kwh[a] * 0.20;
+        printf("   - Cutting its runtime by 20%% saves %.2f kWh", cut);
+        if (s->tariff > 0) printf(" (about %.2f)", cut * s->tariff);
+        puts(".");
+
+        /* Suggestion type 2: rules based on rating and hours */
+        if (A->watts >= 1000)
+            puts("   - High-wattage device: avoid peak hours and use timers/thermostats.");
+        if (hrs[a] > 100)
+            puts("   - Very long runtime: consider a higher star-rated / inverter model.");
+        if (A->watts <= 25)
+            puts("   - Low-wattage device: if it is an old bulb, LED is already best.");
+    }
+    if (!shown) puts("No usage recorded in this period.");
+    puts("\nGeneral tip: unplug idle chargers/TVs; standby loads add up all month.");
+
+    /* Suggestion type 3: user-chosen "replace X hrs of device A with B" */
+    while (n >= 2 && read_int("\nTry a replacement what-if? 1 = yes, 0 = no: ", 0, 1)) {
+        puts("Device to cut back on (A):");
+        int ia = select_appliance(s);
+        puts("Device to use instead (B):");
+        int ib = select_appliance(s);
+        if (ia == ib || s->apps[ib].watts >= s->apps[ia].watts) {
+            puts("  B must draw less power than A for this to save energy.");
+            continue;
+        }
+        double max_h = hrs[ia] > 0 ? hrs[ia] : 1000;
+        printf("Hours of %s in this period: %.2f\n", s->apps[ia].name, hrs[ia]);
+        double x = read_double("Hours to replace with B: ", 0, max_h);
+        double saved = x * (s->apps[ia].watts - s->apps[ib].watts) / 1000.0;
+        printf("  Replacing %.1f hrs of %s with %s saves %.2f kWh", x,
+               s->apps[ia].name, s->apps[ib].name, saved);
+        if (s->tariff > 0) printf(" (about %.2f)", saved * s->tariff);
+        puts(".");
+    }
+    free(kwh); free(hrs); free(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/*  File persistence                                                   */
+/* ------------------------------------------------------------------ */
+
+static int save_data(const Store *s)
+{
+    FILE *f = fopen(DATA_FILE, "w");
+    if (!f) return 0;
+    fprintf(f, "TARIFF %.4f\n", s->tariff);
+    fprintf(f, "APPLIANCES %zu\n", s->app_count);
+    for (size_t i = 0; i < s->app_count; i++)
+        fprintf(f, "%s|%.4f\n", s->apps[i].name, s->apps[i].watts);
+    fprintf(f, "USAGES %zu\n", s->log_count);
+    for (size_t i = 0; i < s->log_count; i++) {
+        const Usage *u = &s->logs[i];
+        fprintf(f, "%d %d %d %d %d %d %d\n", u->app_id, u->day, u->month,
+                u->year, u->start_min, u->end_min, u->days_used);
+    }
+    fclose(f);
+    return 1;
+}
+
+static int load_data(Store *s)
+{
+    FILE *f = fopen(DATA_FILE, "r");
+    if (!f) return 0;
+    char line[LINE_LEN];
+    size_t na = 0, nl = 0;
+
+    if (!fgets(line, sizeof line, f) || sscanf(line, "TARIFF %lf", &s->tariff) != 1) goto bad;
+    if (!fgets(line, sizeof line, f) || sscanf(line, "APPLIANCES %zu", &na) != 1) goto bad;
+    for (size_t i = 0; i < na; i++) {
+        char name[NAME_LEN];
+        double w;
+        if (!fgets(line, sizeof line, f) ||
+            sscanf(line, "%49[^|]|%lf", name, &w) != 2) goto bad;
+        Appliance *a = new_appliance_slot(s);
+        if (!a) goto bad;
+        strcpy(a->name, name);
+        a->watts = w;
+    }
+    if (!fgets(line, sizeof line, f) || sscanf(line, "USAGES %zu", &nl) != 1) goto bad;
+    for (size_t i = 0; i < nl; i++) {
+        Usage t;
+        if (!fgets(line, sizeof line, f) ||
+            sscanf(line, "%d %d %d %d %d %d %d", &t.app_id, &t.day, &t.month,
+                   &t.year, &t.start_min, &t.end_min, &t.days_used) != 7) goto bad;
+        if (t.app_id < 0 || (size_t)t.app_id >= s->app_count) goto bad;
+        Usage *u = new_usage_slot(s);
+        if (!u) goto bad;
+        *u = t;
+        compute_usage(&s->apps[u->app_id], u);
+    }
+    fclose(f);
+    return 1;
+bad:
+    fclose(f);
+    puts("Warning: data file is damaged or incomplete; partial data loaded.");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main menu                                                          */
+/* ------------------------------------------------------------------ */
+
+static void print_menu(const Store *s)
+{
+    printf("\n===== Smart Energy Consumption Analyzer =====\n");
+    printf("Appliances: %zu | Entries: %zu | Tariff: %.2f/kWh\n",
+           s->app_count, s->log_count, s->tariff);
+    puts(" 1. Add appliance");
+    puts(" 2. Edit appliance");
+    puts(" 3. List appliances");
+    puts(" 4. Add usage entry");
+    puts(" 5. Edit / delete usage entry");
+    puts(" 6. List usage entries");
+    puts(" 7. Set tariff (cost per kWh)");
+    puts(" 8. Monthly report (kWh and cost per appliance)");
+    puts(" 9. Top 3 highest-consuming appliances");
+    puts("10. Monthly comparison chart");
+    puts("11. Suggestions to reduce consumption");
+    puts("12. Save data");
+    puts(" 0. Save and exit");
+}
+
+int main(void)
+{
+    Store store;
+    if (!store_init(&store)) {
+        fputs("Fatal: could not allocate memory.\n", stderr);
+        return 1;
+    }
+    g_store = &store;
+
+    if (load_data(&store))
+        printf("Loaded %zu appliances and %zu usage entries from %s.\n",
+               store.app_count, store.log_count, DATA_FILE);
+    else
+        puts("Starting with an empty data set.");
+
+    int choice;
+    do {
+        print_menu(&store);
+        choice = read_int("Choice: ", 0, 12);
+        switch (choice) {
+            case 1:  add_appliance(&store);           break;
+            case 2:  edit_appliance(&store);          break;
+            case 3:  list_appliances(&store);         break;
+            case 4:  add_usage(&store);               break;
+            case 5:  edit_or_delete_usage(&store);    break;
+            case 6:  list_usage(&store);              break;
+            case 7:  set_tariff(&store);              break;
+            case 8:  report_monthly(&store);          break;
+            case 9:  report_top3(&store);             break;
+            case 10: report_comparison(&store);       break;
+            case 11: report_suggestions(&store);      break;
+            case 12:
+                puts(save_data(&store) ? "Data saved." : "Error: could not write file.");
+                break;
+            default: break;
+        }
+        /* keep the file up to date after every change */
+        if (choice >= 1 && choice <= 7 && choice != 3 && choice != 6)
+            save_data(&store);
+    } while (choice != 0);
+
+    if (!save_data(&store)) fputs("Warning: could not save data.\n", stderr);
+    else puts("Data saved. Goodbye!");
+    store_free(&store);
+    return 0;
+}
